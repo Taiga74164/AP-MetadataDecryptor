@@ -1,0 +1,92 @@
+name: Build & Release
+
+# Builds Release|x64 and publishes a GitHub release on every push to main.
+#
+# Version selection (first match wins):
+#   1. "version" input when run manually (workflow_dispatch)
+#   2. VERSION file at the repo root, if that tag doesn't exist yet
+#   3. Latest semver tag with the patch number bumped (1.0.0 -> 1.0.1)
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 1.2.0). Leave empty to auto-bump patch.'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build
+        run: msbuild AP-MetadataDecryptor.sln /m /p:Configuration=Release /p:Platform=x64
+
+      - name: Determine version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          tag_exists() { git rev-parse -q --verify "refs/tags/$1" >/dev/null; }
+
+          ver="${INPUT_VERSION#v}"
+          if [ -z "$ver" ] && [ -f VERSION ]; then
+            file_ver="$(tr -d '[:space:]' < VERSION)"
+            file_ver="${file_ver#v}"
+            if [ -n "$file_ver" ] && ! tag_exists "$file_ver"; then
+              ver="$file_ver"
+            fi
+          fi
+
+          if [ -z "$ver" ]; then
+            latest="$(git tag --list | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n1 || true)"
+            if [ -z "$latest" ]; then
+              ver="1.0.0"
+            else
+              IFS=. read -r major minor patch <<< "$latest"
+              ver="$major.$minor.$((patch + 1))"
+            fi
+          fi
+
+          if tag_exists "$ver"; then
+            echo "::error::Tag $ver already exists"
+            exit 1
+          fi
+          echo "Releasing $ver"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cat > notes.md <<'EOF'
+          ## Usage:
+          - `AP-MetadataDecryptor.exe <encrypted_metadata.dat> <output_metadata.dat>`
+          EOF
+          gh release create "$VERSION" \
+            "bin/Release-x64/AP-MetadataDecryptor.exe" \
+            --target "$GITHUB_SHA" \
+            --title "AP-MetadataDecryptor v$VERSION" \
+            --notes-file notes.md \
+            --generate-notes
